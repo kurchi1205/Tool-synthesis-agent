@@ -6,116 +6,15 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
 load_dotenv()
 
-from executors import EXECUTOR_MAP, draft_message, check_calendar, check_notion
 from storage import (
-    get_users, get_tools, append_tool, write_json, read_json,
-    find_matching_tool, slack_id_to_user_id, tool_already_saved,
+    get_users, get_tools, write_json, read_json,
+    find_matching_tool, slack_id_to_user_id,
 )
 from calendar_auth import (
     is_calendar_connected, generate_auth_url, start_callback_server,
 )
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
-
-# In-memory pending proposals — { slack_user_id: pattern_dict }
-pending_proposals: dict[str, dict] = {}
-
-
-# ── PART 1: Live-updating checklist ──────────────────────────────────────────
-
-def run_tool(tool: dict, slot_value: str, channel: str, client) -> None:
-    """
-    Posts a checklist message and updates it step-by-step as each executor runs.
-    """
-    steps = tool["sequence"]
-
-    def render_checklist(results: dict, running: str = None) -> str:
-        lines = [f"Running *{tool['tool_name']}* for *{slot_value}*..."]
-        for step in steps:
-            if step in results:
-                lines.append(f"✅ {step} — {results[step]}")
-            elif step == running:
-                lines.append(f"\\ {step}")   # backslash = in progress
-            else:
-                lines.append(f"☐ {step}")
-        return "\n".join(lines)
-
-    # Post initial message — all boxes unchecked
-    resp = client.chat_postMessage(
-        channel=channel,
-        text=render_checklist({})
-    )
-    msg_ts = resp["ts"]
-
-    results = {}
-    for step in steps:
-        # Show backslash on the currently running step
-        client.chat_update(
-            channel=channel,
-            ts=msg_ts,
-            text=render_checklist(results, running=step)
-        )
-
-        executor = EXECUTOR_MAP.get(step)
-        try:
-            result = executor(slot_value) if executor else f"no executor for {step}"
-        except Exception as e:
-            result = f"error: {e}"
-
-        results[step] = result
-
-        # Tick the completed step to done
-        client.chat_update(
-            channel=channel,
-            ts=msg_ts,
-            text=render_checklist(results)
-        )
-        time.sleep(0.5)  # visible delay so each step ticks off on screen
-
-    # Final completion update
-    client.chat_update(
-        channel=channel,
-        ts=msg_ts,
-        text=render_checklist(results) + f"\n\n✅ *{tool['tool_name']}* complete."
-    )
-
-
-# ── PART 2: Proposal + confirmation ──────────────────────────────────────────
-
-def propose_tool(user_id: str, pattern: dict) -> None:
-    """Called by detect_loop when a repeated pattern is found for a user."""
-    users = get_users()
-    slack_id = users[user_id]["slack_id"]
-
-    # Auto-generate tool name from description
-    words = pattern.get("description", "routine").lower().split()[:3]
-    tool_name = "_".join(w.strip(".,") for w in words)
-    pattern["tool_name"] = tool_name
-
-    sequence_str = " → ".join(pattern["sequence"])
-    msg = (
-        f"I noticed you've done this {len(pattern['sequence'])}-step sequence at least twice:\n"
-        f"*{sequence_str}*\n"
-        f"Each time for a different *{pattern['slot']}*.\n\n"
-        f"Want me to save this as a reusable tool called `{tool_name}`?\n"
-        f"Reply *yes* to confirm."
-    )
-
-    dm_channel = _open_dm(slack_id, app.client)
-    app.client.chat_postMessage(channel=dm_channel, text=msg)
-    pending_proposals[slack_id] = pattern
-    print(f"[slack_bot] proposed tool '{tool_name}' to {user_id} ({slack_id})")
-
-
-def confirm_tool(slack_id: str, user_id: str, say) -> None:
-    pattern = pending_proposals.pop(slack_id)
-    pattern["confirmed"] = True
-    append_tool(user_id, pattern)
-    print(f"[slack_bot] confirmed tool '{pattern['tool_name']}' for {user_id}")
-    say(
-        f"✅ Saved `{pattern['tool_name']}`.\n"
-        f"Run it anytime with: `/tool {pattern['tool_name']} for [name]`"
-    )
 
 
 # ── PART 4: Slash command — /tool ─────────────────────────────────────────────
@@ -181,7 +80,8 @@ def handle_slash_tool(ack, body, say, client):
     else:
         tool       = matches[0]
         slot_value = extract_slot(text, tool["slot"])
-        run_tool(tool, slot_value, channel, client)
+        from agent_graph import run_tool_graph
+        run_tool_graph(user_id, tool, slot_value, channel)
 
 
 # ── PART 3: Message routing ───────────────────────────────────────────────────
@@ -209,27 +109,16 @@ def handle_message(message, say, client):
         _prompt_calendar_setup(user_id, slack_user_id, client)
         return
 
-    # Manual demo trigger
+    # Manual demo trigger — run the full LangGraph agent cycle now
     if text == "!poll now":
-        from poller import poll_now
-        from detect import find_repeated_pattern
-        user_id = slack_id_to_user_id(slack_user_id)
-        poll_now(user_id)
-        if user_id:
-            pattern = find_repeated_pattern(user_id)
-            if pattern and not tool_already_saved(user_id, pattern["sequence"]):
-                propose_tool(user_id, pattern)
-                say("Polled and found a pattern — check your DMs.")
-            else:
-                say("Polled. No new pattern found yet.")
+        from agent_graph import run_for_user
+        run_for_user(user_id)
+        say("Agent run triggered — check your DMs if a new pattern was found.")
         return
 
-    # Pending proposal?
-    if slack_user_id in pending_proposals:
-        if "yes" in text.lower():
-            confirm_tool(slack_user_id, user_id, say)
-        else:
-            say("Reply *yes* to confirm saving the tool, or ignore to skip.")
+    # Pending proposal? Route reply through LangGraph resume
+    from agent_graph import resume_for_user
+    if resume_for_user(slack_user_id, text, say):
         return
 
     matches = find_matching_tool(user_id, text)
@@ -242,7 +131,8 @@ def handle_message(message, say, client):
     else:
         tool = matches[0]
         slot_value = extract_slot(text, tool["slot"])
-        run_tool(tool, slot_value, channel, client)
+        from agent_graph import run_tool_graph
+        run_tool_graph(user_id, tool, slot_value, channel)
 
 
 # ── PART 5: New user registration + calendar setup ───────────────────────────

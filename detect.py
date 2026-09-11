@@ -1,12 +1,45 @@
 import json
+import re
 import sys
-import time
 import ollama
 from storage import get_users, get_events, tool_already_saved
 from dotenv import load_dotenv
 load_dotenv()
 
 OLLAMA_MODEL = "llama3.1:8b"
+
+
+def _extract_json(text: str) -> dict:
+    """
+    Robustly extract the first JSON object from LLM output.
+
+    Tries in order:
+      1. Direct json.loads on the full text.
+      2. Strip ``` / ```json fences, then json.loads.
+      3. Regex-find the first {...} block (handles any preamble / postamble text).
+    Raises json.JSONDecodeError if all three attempts fail.
+    """
+    text = text.strip()
+
+    # 1. Plain JSON
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Strip code fences wherever they appear
+    stripped = re.sub(r"```(?:json)?", "", text).strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Pull out the first {...} block (greedy, dot matches newline)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+
+    raise json.JSONDecodeError("no JSON object found in LLM output", text, 0)
 
 
 def cluster_by_time(events: list[dict], window_minutes: int = 10) -> list[list[dict]]:
@@ -57,41 +90,33 @@ Events (in time order):
 
 Determine if these events represent one coherent multi-step routine a user repeats.
 
-Reply with ONLY valid JSON, no explanation:
+Reply with ONLY a valid JSON object, no explanation, no markdown:
 {{
-  "is_routine": true or false,
-  "sequence": ["source1", "source2", ...],
+  "is_routine": true,
+  "sequence": ["source1", "source2"],
   "slot": "the thing that varies each time (e.g. person, topic, vendor)",
   "slot_value": "the specific value in THIS instance",
   "description": "one sentence describing the routine"
 }}
 
-If not a routine, reply: {{"is_routine": false}}"""
+If these events are NOT a routine, reply with exactly: {{"is_routine": false}}"""
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
-            print(f"[ollama] calling {OLLAMA_MODEL} (attempt {attempt + 1}/2) with {len(cluster)} events ...")
+            print(f"[ollama] calling {OLLAMA_MODEL} (attempt {attempt + 1}/3) with {len(cluster)} events ...")
             resp = ollama.chat(
                 model=OLLAMA_MODEL,
                 messages=[{"role": "user", "content": prompt}]
             )
-            text = resp["message"]["content"].strip()
-            print(f"[ollama] raw response: {text[:200]}{'...' if len(text) > 200 else ''}")
-            # Strip markdown code fences if present
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            result = json.loads(text)
+            raw = resp["message"]["content"].strip()
+            print(f"[ollama] raw response: {raw[:200]}{'...' if len(raw) > 200 else ''}")
+            result = _extract_json(raw)
             print(f"[ollama] parsed: is_routine={result.get('is_routine')}, sequence={result.get('sequence')}")
             if result.get("is_routine"):
                 return result
             return None
         except (json.JSONDecodeError, KeyError) as e:
-            print(f"[ollama] parse error (attempt {attempt + 1}): {e}")
-            if attempt == 0:
-                continue
-            return None
+            print(f"[ollama] parse error (attempt {attempt + 1}/3): {e}")
     return None
 
 
@@ -127,21 +152,6 @@ def find_repeated_pattern(user_id: str) -> dict | None:
 
     return None
 
-
-def detect_loop(interval_seconds: int = 15) -> None:
-    # Import here to avoid circular import
-    from slack_bot import propose_tool
-
-    while True:
-        users = get_users()
-        for user_id in users:
-            try:
-                pattern = find_repeated_pattern(user_id)
-                if pattern and not tool_already_saved(user_id, pattern["sequence"]):
-                    propose_tool(user_id, pattern)
-            except Exception as e:
-                print(f"[detect] {user_id} error: {e}")
-        time.sleep(interval_seconds)
 
 
 if __name__ == "__main__":
