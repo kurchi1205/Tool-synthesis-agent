@@ -19,11 +19,12 @@ poll → cluster → llm → pattern
                                            ↓
                                         confirm
                                            |
-                                    discarded → END
-                                           |
-                                       confirmed
-                                           ↓
-                                        executor → END
+                              ┌────────────┼────────────┐
+                           "yes"     change request     "no"
+                              ↓            ↓              ↓
+                           executor   re_propose → human  END
+                              ↓        (loop until yes/no)
+                             END
 ```
 
 When a user runs a saved tool, a separate single-node `execute_graph` runs it with a live Slack checklist.
@@ -36,15 +37,14 @@ When a user runs a saved tool, a separate single-node `execute_graph` runs it wi
 | `cluster` | Groups events that happen within a 10-minute window |
 | `llm` | Calls Ollama (`llama3.1:8b`) on each cluster to decide if it's a routine |
 | `pattern` | Finds sequences that repeat 2+ times and aren't already saved |
-| `propose` | Generates a full tool definition via Ollama, DMs the user in Slack |
+| `propose` | Generates a full tool definition via Ollama (with named `args`), DMs the user |
 | `human` | LangGraph interrupt — pauses the graph until the user replies |
-| `confirm` | Saves the tool (with optional inline edits) or discards it |
-| `executor` | Calls Ollama to generate a custom Python executor function for the tool |
+| `confirm` | Routes to `executor` (yes), `re_propose` (change request), or `END` (no) |
+| `re_propose` | Applies a natural-language change request via Ollama and re-sends the proposal |
+| `executor` | Calls Ollama to generate a custom `execute(args: dict)` function for the tool |
 | `execute` | Runs a saved tool and posts a live-updating Slack checklist |
 
 ### Background Threads
-
-Three threads run concurrently when the app starts:
 
 | Thread | Interval | What it does |
 |---|---|---|
@@ -144,7 +144,7 @@ NOTION_DB_ID=...
 1. Go to [Google Cloud Console](https://console.cloud.google.com) → create a project → enable the **Google Calendar API**
 2. **APIs & Services → Credentials** → create an **OAuth 2.0 Client ID** (Desktop app) → download as `credentials.json` into the project root
 
-The bot handles the rest automatically — no manual auth steps needed. When it starts, it scans the workspace and DMs any user who hasn't connected their calendar yet with an OAuth link. The user clicks it, approves in the browser, and the token is saved. A local callback server runs on `http://localhost:8080` to receive the OAuth redirect.
+The bot handles the rest automatically. When it starts, it scans the workspace and DMs any user who hasn't connected their calendar yet with an OAuth link. The user clicks it, approves in the browser, and the token is saved. A local callback server runs on `http://localhost:8080` to receive the OAuth redirect.
 
 ---
 
@@ -179,9 +179,10 @@ Send `!poll now` in any Slack channel the bot can see. It will immediately poll 
 
 | Command | What it does |
 |---|---|
-| `/setup` | Sends you a Google Calendar OAuth link (re-runs if already connected) |
-| `/tool` | Lists your saved tools |
-| `/tool weekly_sync for Alice` | Runs the `weekly_sync` tool for Alice |
+| `/setup` | Sends you a Google Calendar OAuth link |
+| `/tool` | Lists your saved tools with argument hints |
+| `/tool weekly_sync person=Alice` | Runs the `weekly_sync` tool with `person=Alice` |
+| `/tool prep_meeting person=Alice topic=Q3` | Runs a tool with multiple arguments |
 
 ### App Home
 
@@ -200,27 +201,58 @@ You've done this 3-step sequence at least twice:
 Proposed tool: `weekly_sync`
 Checks your calendar, open Notion tasks, and sends a check-in message.
 
-What you need to provide: a person's name
+Arguments you provide each run:
+  • `person` — who the sync is with  (e.g. Alice)
 
-Example: /tool weekly_sync for Alice
+Example: /tool weekly_sync person=Alice
 
-Reply yes to save this tool as-is.
-Or suggest changes inline, e.g: yes, call it prep_meeting and it's for a topic not a person
-Reply no to discard.
+Reply yes to save, no to discard, or describe a change.
 ```
 
-**Inline edits supported when confirming:**
-- `yes, call it prep_meeting` — renames the tool
-- `yes but slot is topic` — changes what the variable input represents
-- `yes, description: prep for weekly standups` — updates the description
+**Responding:**
+- `yes` — saves the tool immediately
+- `no` — discards the proposal
+- Anything else is treated as a **change request** — Ollama applies it and re-sends the updated proposal. This loops until you say yes or no.
+
+  Examples:
+  - `call it prep_meeting` — renames the tool
+  - `add a topic argument` — Ollama updates the args list
+  - `the description should be: prep for weekly check-ins` — updates description
 
 ### Running a saved tool
 
 ```
-weekly_sync for Alice
+/tool weekly_sync person=Alice
+```
+
+Or just message the bot directly:
+
+```
+weekly_sync person=Alice
+```
+
+Positional args also work if you only have one argument:
+
+```
+weekly_sync Alice
 ```
 
 The bot posts a live Slack checklist that ticks off each step as it completes.
+
+---
+
+## Executor Sandbox
+
+When a tool is confirmed, `executor_node` calls Ollama to generate a custom `execute(args: dict)` function. The generated code runs in a restricted sandbox with only these helper functions available:
+
+| Function | What it does |
+|---|---|
+| `check_calendar(person)` | Returns the next upcoming calendar event involving the person |
+| `check_notion(person)` | Returns open Notion tasks mentioning the person |
+| `create_calendar_event(person, topic, time_str, duration_minutes)` | Creates a calendar event |
+| `add_notion_page(title, notes)` | Creates a new Notion page |
+| `post_slack(text)` | Posts a message to the default Slack channel |
+| `draft_message(person, calendar_result, notion_result)` | Builds a check-in message combining calendar and Notion results |
 
 ---
 
@@ -232,7 +264,8 @@ agent_graph.py     — LangGraph graph wiring and public API
 nodes.py           — all node functions + AgentState schema
 detect.py          — time-based clustering + Ollama routine interpretation
 poller.py          — Google Calendar, Notion, and Slack pollers
-executors.py       — executor helper functions (calendar, notion, slack, draft)
+tools.py           — executor helper functions (calendar, notion, slack)
+executors.py       — deprecated shim that re-exports from tools.py
 slack_bot.py       — Slack Bolt app, setup loop, message routing, tool runner
 calendar_auth.py   — Google OAuth flow + local callback server (port 8080)
 storage.py         — JSON file read/write helpers
@@ -257,18 +290,25 @@ Notion           ──┼──► poller ──► event_log.json ──► cl
 Slack history    ──┘                                                      │
                                                                           ▼
                                                                    pattern detection
+                                                                    (args schema)
                                                                           │
                                                                  Ollama (propose_node)
                                                                           │
                                                                  Slack DM to user
                                                                           │
-                                                               user replies yes/no
-                                                                          │
-                                                            Ollama (executor_node)
-                                                                          │
-                                                                tools_store.json
-                                                                          │
-                                                         user types "tool_name for X"
-                                                                          │
-                                                            live Slack checklist
+                                                      ┌───────────────────┤
+                                                   "yes"            change request
+                                                      │                   │
+                                                      │          Ollama (re_propose)
+                                                      │                   │
+                                                      │            re-DM user (loop)
+                                                      │
+                                             Ollama (executor_node)
+                                              generates execute(args)
+                                                      │
+                                                tools_store.json
+                                                      │
+                                          user: /tool name key=value
+                                                      │
+                                            live Slack checklist
 ```
