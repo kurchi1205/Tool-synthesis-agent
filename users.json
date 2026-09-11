@@ -1,0 +1,12 @@
+{
+  "u1":  {"slack_id": "U0ABC123", "notion_filter": "u1",  "label": "Alice"},
+  "u2":  {"slack_id": "U0DEF456", "notion_filter": "u2",  "label": "Bob"},
+  "u3":  {"slack_id": "U0GHI789", "notion_filter": "u3",  "label": "Carol"},
+  "u4":  {"slack_id": "U0JKL012", "notion_filter": "u4",  "label": "Dave"},
+  "u5":  {"slack_id": "U0MNO345", "notion_filter": "u5",  "label": "Eve"},
+  "u6":  {"slack_id": "U0PQR678", "notion_filter": "u6",  "label": "Frank"},
+  "u7":  {"slack_id": "U0STU901", "notion_filter": "u7",  "label": "Grace"},
+  "u8":  {"slack_id": "U0VWX234", "notion_filter": "u8",  "label": "Hank"},
+  "u9":  {"slack_id": "U0YZA567", "notion_filter": "u9",  "label": "Iris"},
+  "u10": {"slack_id": "U0BCD890", "notion_filter": "u10", "label": "Jake"}
+}
