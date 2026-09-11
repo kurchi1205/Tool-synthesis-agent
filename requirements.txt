@@ -1,0 +1,8 @@
+ollama
+slack-bolt
+slack-sdk
+requests
+python-dotenv
+google-auth
+google-auth-oauthlib
+google-api-python-client
