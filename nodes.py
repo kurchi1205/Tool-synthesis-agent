@@ -49,7 +49,7 @@ class AgentState(TypedDict, total=False):
         user_response        str | None
 
     Fields used by the execute graph:
-        slot_value           str   — the value the user provided (e.g. "Alice")
+        args                 dict  — argument values provided by the user (e.g. {"person": "Alice"})
         channel              str   — Slack channel ID to post the checklist into
         execution_result     str | None — one-line summary returned by execute()
     """
@@ -61,10 +61,11 @@ class AgentState(TypedDict, total=False):
     tool_definition: Optional[dict]
     dm_channel: Optional[str]
     user_response: Optional[str]
-    slot_value: str
+    args: Optional[dict]
     channel: str
     execution_result: Optional[str]
     needs_reconfirmation: Optional[bool]
+    user_change_request: Optional[str]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,7 +110,7 @@ def cluster_node(state: AgentState) -> dict:
 def llm_node(state: AgentState) -> dict:
     """
     Calls Ollama (llama3.1:8b) on each cluster to decide if it is a routine
-    and, if so, extracts the sequence / slot / description.
+    and, if so, extracts the sequence, args, and description.
     """
     clusters = state.get("clusters") or []
     interpreted = []
@@ -159,10 +160,10 @@ def propose_node(state: AgentState) -> dict:
     pattern = dict(state["pattern"])
 
     # Build LLM prompt
+    args_text = json.dumps(pattern.get("args", []), indent=2)
     summary = (
         f"Sequence: {' → '.join(pattern['sequence'])}. "
-        f"Slot (what varies): {pattern.get('slot', '?')}. "
-        f"Example value: {pattern.get('slot_value', '?')}. "
+        f"Arguments (what varies): {args_text}. "
         f"Description: {pattern.get('description', '')}."
     )
     prompt = f"""A user has been detected repeating this workflow pattern:
@@ -174,9 +175,11 @@ Reply with ONLY valid JSON:
 {{
   "tool_name": "snake_case name, max 4 words",
   "description": "one clear sentence: what this tool does and when to use it",
+  "args": [
+    {{"name": "arg_name", "description": "what the user provides for this argument", "example": "example value"}}
+  ],
   "steps": ["step 1 description", "step 2 description", ...],
-  "what_you_provide": "explain what input the user must give when running this tool",
-  "example": "example invocation e.g. /tool weekly_sync for Alice"
+  "example": "example invocation e.g. /tool weekly_sync person=Alice"
 }}"""
 
     try:
@@ -192,7 +195,7 @@ Reply with ONLY valid JSON:
             "tool_name": "_".join(w.strip(".,") for w in words),
             "description": pattern.get("description", "Detected workflow"),
             "steps": [f"Run {s}" for s in pattern["sequence"]],
-            "what_you_provide": f"the {pattern.get('slot', 'value')}",
+            "what_you_provide": f"the required arguments",
             "example": f"/tool {pattern.get('tool_name', 'tool')} for [name]",
         }
 
@@ -200,6 +203,11 @@ Reply with ONLY valid JSON:
 
     # Build DM text
     steps_str = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(definition["steps"]))
+    tool_args = definition.get("args") or []
+    args_str  = "\n".join(
+        f"  • `{a['name']}` — {a.get('description', '')}  _(e.g. {a.get('example', '...')})_"
+        for a in tool_args
+    ) or "  _(none)_"
     msg = (
         f":mag: *I noticed a repeated workflow pattern!*\n\n"
         f"You've done this *{len(pattern['sequence'])}-step sequence* at least twice:\n"
@@ -207,12 +215,12 @@ Reply with ONLY valid JSON:
         f"*Proposed tool:* `{definition['tool_name']}`\n"
         f"_{definition['description']}_\n\n"
         f"*What it does:*\n{steps_str}\n\n"
-        f"*What you need to provide:*\n  {definition['what_you_provide']}\n\n"
+        f"*Arguments you provide each run:*\n{args_str}\n\n"
         f"*Example usage:*\n  `{definition['example']}`\n\n"
         f"───────────────────────\n"
-        f"Reply *yes* to save this tool as-is.\n"
-        f"Or suggest changes inline, e.g: *yes, call it `prep_meeting` and it's for a topic not a person*\n"
-        f"Reply *no* to discard."
+        f"*yes* — save this tool\n"
+        f"*no* — discard\n"
+        f"or describe any change you'd like (e.g. _call it prep_meeting_ or _add a topic argument_)"
     )
 
     # Lazy import to avoid circular dependency (slack_bot imports agent_graph)
@@ -248,78 +256,106 @@ def human_node(state: AgentState) -> dict:
 def confirm_node(state: AgentState) -> dict:
     """
     Three outcomes based on user_response:
-      "yes" (no edits)     → save immediately, confirmed=True
-      "yes, call it X …"  → apply edits, set needs_reconfirmation=True,
-                             route to re_propose_node so the user sees
-                             the changes before the tool is saved
-      "no"                 → discard
+      "yes"   → save immediately, confirmed=True
+      "no"    → discard
+      anything else → treat as a change request; route to re_propose_node
     """
     user_id = state["user_id"]
     pattern = dict(state.get("pattern") or {})
     user_text = (state.get("user_response") or "").strip()
+    lower = user_text.lower()
 
-    if "yes" not in user_text.lower():
+    if lower.startswith("yes") and len(lower) <= 4:
+        # Plain "yes" — save now
+        pattern["confirmed"] = True
+        append_tool(user_id, pattern)
+        print(f"[node:confirm] saved '{pattern['tool_name']}' for {user_id}")
+        return {"pattern": pattern, "needs_reconfirmation": False, "user_change_request": None}
+
+    if lower.startswith("no") and len(lower) <= 3:
         print(f"[node:confirm] discarded for {user_id}")
-        return {"pattern": None, "needs_reconfirmation": False}
+        return {"pattern": None, "needs_reconfirmation": False, "user_change_request": None}
 
-    # Detect inline edits
-    has_edits = False
-
-    rename = re.search(r"(?:call it|rename to|name it)\s+[`']?(\w+)[`']?", user_text, re.I)
-    if rename:
-        pattern["tool_name"] = rename.group(1).lower()
-        has_edits = True
-
-    slot = re.search(r"(?:slot is|it's for a|for a)\s+(\w+)", user_text, re.I)
-    if slot:
-        pattern["slot"] = slot.group(1).lower()
-        has_edits = True
-
-    desc = re.search(r"description[:\s]+(.+?)(?:\.|$)", user_text, re.I)
-    if desc:
-        pattern["description"] = desc.group(1).strip()
-        has_edits = True
-
-    if has_edits:
-        # Show the updated proposal first — don't save yet
-        print(f"[node:confirm] inline edits detected for '{pattern['tool_name']}' — re-proposing")
-        pattern.pop("confirmed", None)
-        return {"pattern": pattern, "needs_reconfirmation": True}
-
-    # Plain "yes" with no edits — save now
-    pattern["confirmed"] = True
-    pattern.pop("needs_reconfirmation", None)
-    append_tool(user_id, pattern)
-    print(f"[node:confirm] saved '{pattern['tool_name']}' for {user_id}")
-    return {"pattern": pattern, "needs_reconfirmation": False}
+    # Any other response = change request
+    print(f"[node:confirm] change request from {user_id}: '{user_text[:80]}'")
+    return {"needs_reconfirmation": True, "user_change_request": user_text}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Node 7b — re_propose_node
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _apply_change_request(pattern: dict, change_request: str) -> dict:
+    """
+    Calls Ollama to apply a natural-language change request to the tool definition.
+    Returns an updated copy of pattern.
+    """
+    prompt = f"""You are updating a workflow tool definition based on user feedback.
+
+Current tool:
+  name: {pattern.get('tool_name', '')}
+  description: {pattern.get('description', '')}
+  args: {json.dumps(pattern.get('args', []))}
+  steps: {json.dumps(pattern.get('steps', []))}
+
+User requested change: "{change_request}"
+
+Apply only what the user asked. Return ONLY a valid JSON object with any changed fields.
+You may include: "tool_name", "description", "args", "steps".
+For "args", return the full updated list.
+Omit fields that should stay the same."""
+
+    try:
+        print(f"[node:re_propose] applying change via Ollama: '{change_request[:80]}'")
+        resp = ollama.chat(model="llama3.1:8b", messages=[{"role": "user", "content": prompt}])
+        raw = resp["message"]["content"].strip()
+        updates = _extract_json(raw)
+        updated = dict(pattern)
+        for key in ("tool_name", "description", "args", "steps"):
+            if key in updates:
+                updated[key] = updates[key]
+        return updated
+    except Exception as e:
+        print(f"[node:re_propose] Ollama change failed: {e} — pattern unchanged")
+        return dict(pattern)
+
+
 def re_propose_node(state: AgentState) -> dict:
     """
-    Sends a DM showing the edited tool definition and asks for a clean yes/no.
-    Reached only when confirm_node detected inline edits.
-    Clears needs_reconfirmation so the next pass through confirm_node saves directly.
+    Applies the user's change request to the tool definition via Ollama,
+    then re-sends the proposal DM with the same yes / no / describe-change options.
+    Loops back through human_node → confirm_node until the user says yes or no.
     """
     from slack_bot import app as _slack_app
 
     user_id = state["user_id"]
     pattern = dict(state["pattern"])
-    pattern.pop("needs_reconfirmation", None)
+    change_request = (state.get("user_change_request") or "").strip()
+
+    if change_request:
+        pattern = _apply_change_request(pattern, change_request)
+
+    pattern.pop("confirmed", None)
 
     users = get_users()
     slack_id = users[user_id]["slack_id"]
 
+    steps_str = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(pattern.get("steps", [])))
+    tool_args = pattern.get("args") or []
+    args_str  = "\n".join(
+        f"  • `{a['name']}` — {a.get('description', '')}  _(e.g. {a.get('example', '...')})_"
+        for a in tool_args
+    ) or "  _(none)_"
     msg = (
         f"✏️ *Got it — here's the updated tool:*\n\n"
         f"*Name:* `{pattern['tool_name']}`\n"
-        f"*Slot:* `{pattern.get('slot', '?')}`\n"
         f"*Description:* _{pattern.get('description', '')}_\n"
-        f"*Sequence:* `{' → '.join(pattern['sequence'])}`\n\n"
-        f"Reply *yes* to save, or *no* to discard."
+        f"*Arguments:*\n{args_str}\n"
+        f"*Steps:*\n{steps_str}\n\n"
+        f"───────────────────────\n"
+        f"*yes* — save this tool\n"
+        f"*no* — discard\n"
+        f"or describe another change"
     )
 
     dm = _slack_app.client.conversations_open(users=slack_id)
@@ -327,7 +363,12 @@ def re_propose_node(state: AgentState) -> dict:
     _slack_app.client.chat_postMessage(channel=dm_channel, text=msg)
 
     print(f"[node:re_propose] sent updated proposal for '{pattern['tool_name']}' to {user_id}")
-    return {"pattern": pattern, "needs_reconfirmation": False, "user_response": None}
+    return {
+        "pattern": pattern,
+        "needs_reconfirmation": False,
+        "user_response": None,
+        "user_change_request": None,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -357,6 +398,10 @@ Available functions (already in scope — do NOT import anything):
 
     draft_message(person: str, calendar_result: str, notion_result: str) -> str
         Builds a ready-to-send Slack message combining calendar + Notion results.
+
+The function signature is:
+    def execute(args: dict) -> str:
+        # args keys match the tool's argument names, e.g. args["person"], args["topic"]
 """
 
 
@@ -365,17 +410,17 @@ def executor_node(state: AgentState) -> dict:
     Runs only when a tool was confirmed (pattern["confirmed"] == True).
 
     Calls Ollama to generate a custom Python function:
-        def execute(slot_value: str) -> str: ...
+        def execute(args: dict) -> str: ...
 
-    The function body uses the four available executor helpers and is
-    tailored to the tool's specific steps and description.
+    The function body uses the available executor helpers and is
+    tailored to the tool's specific steps and arguments.
 
     The generated code is:
       1. Validated with compile() — discarded if it has syntax errors.
       2. Patched into the tool entry in tools_store.json as "executor_code".
 
     At run-time, execute_node execs this code in a sandbox that
-    exposes only the four helper functions.
+    exposes the helper functions.
     """
     pattern = state.get("pattern") or {}
     if not pattern.get("confirmed"):
@@ -383,7 +428,12 @@ def executor_node(state: AgentState) -> dict:
 
     user_id = state["user_id"]
     tool_name = pattern.get("tool_name", "unknown")
+    tool_args = pattern.get("args") or []
 
+    args_str = "\n".join(
+        f"  args[\"{a['name']}\"]  — {a.get('description', '')}  (e.g. \"{a.get('example', '?')}\")"
+        for a in tool_args
+    ) or "  (none)"
     steps_str = "\n".join(
         f"  {i+1}. {s}" for i, s in enumerate(pattern.get("steps", []))
     )
@@ -391,7 +441,8 @@ def executor_node(state: AgentState) -> dict:
 
 Tool name: {tool_name}
 Description: {pattern.get('description', '')}
-Slot (the input the user provides, e.g. a person's name): {pattern.get('slot', 'value')}
+Arguments available in args dict:
+{args_str}
 Steps to perform:
 {steps_str}
 
@@ -399,17 +450,18 @@ Steps to perform:
 
 Write ONLY this Python function — no imports, no explanation, no markdown:
 
-def execute(slot_value: str) -> str:
+def execute(args: dict) -> str:
+    # access arguments with args["name"]
     # implement the steps above using the available functions
     ...
     return "<one-line summary of what was done>"
 
 Rules:
-- Use slot_value wherever the slot appears (e.g. as the person's name).
-- Call the helper functions in the order matching the steps.
-- If a step involves scheduling or creating a meeting, use create_calendar_event(slot_value).
-- If a step involves adding a task or note, use add_notion_page(slot_value).
-- If a step involves sending a message, use post_slack(draft_message(slot_value, ...)) or post_slack(<text>).
+- Access argument values via args["name"], e.g. args["person"], args["topic"], args["time"].
+- For calendar events: create_calendar_event(person=args["person"], topic=args.get("topic"), time_str=args.get("time"))
+- For Notion pages: add_notion_page(title=args.get("topic") or args.get("person", "Note"))
+- For Slack messages: post_slack(draft_message(args.get("person",""), ...)) or post_slack(<text>)
+- Call functions in the order matching the steps.
 - Return a concise one-line summary string.
 - Do not use any other imports or globals.
 """
@@ -452,7 +504,7 @@ Rules:
 
 def execute_node(state: AgentState) -> dict:
     """
-    Runs the tool stored in state["pattern"] for state["slot_value"].
+    Runs the tool stored in state["pattern"] with state["args"].
     Posts a live-updating Slack checklist to state["channel"].
 
     Two paths:
@@ -463,42 +515,45 @@ def execute_node(state: AgentState) -> dict:
     from slack_bot import app as _slack_app
     import time as _time
 
-    tool       = state["pattern"]
-    slot_value = state["slot_value"]
-    channel    = state["channel"]
-    client     = _slack_app.client
-    tool_name  = tool["tool_name"]
+    tool      = state["pattern"]
+    args      = state.get("args") or {}
+    channel   = state["channel"]
+    client    = _slack_app.client
+    tool_name = tool["tool_name"]
+    user_id   = state["user_id"]
 
     from executors import (
         check_calendar, check_notion, post_slack, draft_message,
         create_calendar_event, add_notion_page, get_executor_map,
     )
 
-    user_id    = state["user_id"]
     executor_map = get_executor_map(user_id)
+
+    # Build a short label for display (e.g. "person=Alice, topic=Q3")
+    args_label = ", ".join(f"{k}={v}" for k, v in args.items()) if args else ""
 
     # ── Path 1: custom executor_code ─────────────────────────────────────────
     if tool.get("executor_code"):
         resp = client.chat_postMessage(
             channel=channel,
-            text=f"\\ Running *{tool_name}* for *{slot_value}*..."
+            text=f"\\ Running *{tool_name}*{(' — ' + args_label) if args_label else ''}..."
         )
         msg_ts = resp["ts"]
         try:
             sandbox = {
-                "check_calendar":       lambda person: check_calendar(person, user_id=user_id),
-                "check_notion":         check_notion,
-                "create_calendar_event": lambda person, **kw: create_calendar_event(person, user_id=user_id, **kw),
-                "add_notion_page":      add_notion_page,
-                "post_slack":           post_slack,
-                "draft_message":        draft_message,
+                "check_calendar":        lambda person: check_calendar(person, user_id=user_id),
+                "check_notion":          check_notion,
+                "create_calendar_event": lambda **kw: create_calendar_event(user_id=user_id, **kw),
+                "add_notion_page":       add_notion_page,
+                "post_slack":            post_slack,
+                "draft_message":         draft_message,
             }
             exec(tool["executor_code"], sandbox)
-            summary = sandbox["execute"](slot_value)
+            summary = sandbox["execute"](args)
             client.chat_update(
                 channel=channel,
                 ts=msg_ts,
-                text=f"✅ *{tool_name}* complete for *{slot_value}*.\n{summary}"
+                text=f"✅ *{tool_name}* complete{(' — ' + args_label) if args_label else ''}.\n{summary}"
             )
             return {"execution_result": summary}
         except Exception as e:
@@ -510,7 +565,8 @@ def execute_node(state: AgentState) -> dict:
     steps = tool["sequence"]
 
     def render(results: dict, running: str = None) -> str:
-        lines = [f"Running *{tool_name}* for *{slot_value}*..."]
+        header = f"Running *{tool_name}*{(' — ' + args_label) if args_label else ''}..."
+        lines = [header]
         for step in steps:
             if step in results:
                 lines.append(f"✅ {step} — {results[step]}")
@@ -528,7 +584,7 @@ def execute_node(state: AgentState) -> dict:
         client.chat_update(channel=channel, ts=msg_ts, text=render(results, running=step))
         executor = executor_map.get(step)
         try:
-            result = executor(slot_value) if executor else f"no executor for {step}"
+            result = executor(args) if executor else f"no executor for {step}"
         except Exception as e:
             result = f"error: {e}"
         results[step] = result

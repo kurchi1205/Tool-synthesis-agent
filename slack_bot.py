@@ -39,8 +39,8 @@ def handle_slash_setup(ack, body, client):
 @app.command("/tool")
 def handle_slash_tool(ack, body, say, client):
     """
-    /tool                          → list this user's saved tools
-    /tool <tool_name> for <slot>   → run the named tool
+    /tool                                    → list this user's saved tools
+    /tool <tool_name> key=value key2=value2  → run the named tool with given args
     """
     ack()
 
@@ -62,8 +62,10 @@ def handle_slash_tool(ack, body, say, client):
             return
         lines = ["*Your saved tools:*"]
         for t in tools:
-            seq = " → ".join(t["sequence"])
-            lines.append(f"• `/tool {t['tool_name']} for [name]`  —  _{t.get('description', seq)}_")
+            tool_args = t.get("args") or []
+            arg_hint  = " ".join(f'{a["name"]}=...' for a in tool_args) if tool_args else ""
+            example   = f"`/tool {t['tool_name']}{(' ' + arg_hint) if arg_hint else ''}`"
+            lines.append(f"• {example}  —  _{t.get('description', '')}_")
         say("\n".join(lines))
         return
 
@@ -71,27 +73,47 @@ def handle_slash_tool(ack, body, say, client):
     matches = find_matching_tool(user_id, text)
 
     if len(matches) == 0:
-        names = [f"`/tool {t['tool_name']} for [name]`" for t in tools]
+        names = [f"`/tool {t['tool_name']}`" for t in tools]
         available = "\n".join(names) if names else "none yet"
         say(f"No matching tool found for `{text}`.\nAvailable:\n{available}")
     elif len(matches) > 1:
         names = [f"`{t['tool_name']}`" for t in matches]
         say(f"Multiple tools match: {', '.join(names)}. Be more specific.")
     else:
-        tool       = matches[0]
-        slot_value = extract_slot(text, tool["slot"])
+        tool = matches[0]
+        args = parse_args(text, tool)
+        if not args:
+            tool_args = tool.get("args") or []
+            hint = " ".join(f'{a["name"]}=...' for a in tool_args)
+            say(f"Please provide arguments: `/tool {tool['tool_name']} {hint}`")
+            return
         from agent_graph import run_tool_graph
-        run_tool_graph(user_id, tool, slot_value, channel)
+        run_tool_graph(user_id, tool, args, channel)
 
 
 # ── PART 3: Message routing ───────────────────────────────────────────────────
 
-def extract_slot(text: str, slot: str) -> str:
-    """Looks for 'for <name>' or 'with <name>'. Falls back to last word."""
-    match = re.search(r"\b(?:for|with)\s+(\w+)", text, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    return text.split()[-1]
+def parse_args(text: str, tool: dict) -> dict:
+    """
+    Parse key=value (or key="multi word") pairs from text.
+    Falls back to positional mapping against the tool's args list if no pairs found.
+    Returns {} if nothing could be parsed.
+    """
+    # Remove leading tool name
+    tool_name = tool.get("tool_name", "")
+    remaining = re.sub(r"^\s*" + re.escape(tool_name) + r"\s*", "", text, flags=re.I).strip()
+
+    # Try key=value or key="quoted value"
+    kv_pairs = re.findall(r'(\w+)=(?:"([^"]*)"|(\\S+))', remaining)
+    if kv_pairs:
+        return {name: (quoted or unquoted) for name, quoted, unquoted in kv_pairs}
+
+    # Positional fallback: assign remaining tokens to arg names in order
+    tool_args = tool.get("args") or []
+    if not tool_args or not remaining:
+        return {}
+    tokens = remaining.split()
+    return {tool_args[i]["name"]: tokens[i] for i in range(min(len(tool_args), len(tokens)))}
 
 
 @app.message("")
@@ -130,9 +152,9 @@ def handle_message(message, say, client):
         say(f"Multiple tools match: {', '.join(names)}. Which one did you mean?")
     else:
         tool = matches[0]
-        slot_value = extract_slot(text, tool["slot"])
+        args = parse_args(text, tool)
         from agent_graph import run_tool_graph
-        run_tool_graph(user_id, tool, slot_value, channel)
+        run_tool_graph(user_id, tool, args, channel)
 
 
 # ── PART 5: New user registration + calendar setup ───────────────────────────

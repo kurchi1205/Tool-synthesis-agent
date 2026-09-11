@@ -206,30 +206,25 @@ def resume_for_user(slack_id: str, user_text: str, say) -> bool:
     Returns False — no pending proposal for this user.
 
     Behaviour:
-        - ambiguous reply (no yes/no) → re-prompt, stay paused
-        - "yes" [+ inline edits]     → confirm_node saves tool
-        - "no"                       → confirm_node discards
+        - "yes"       → confirm_node saves the tool
+        - "no"        → confirm_node discards
+        - anything else → treated as a change request; re_propose_node applies
+                          the change and re-sends the proposal (loops until yes/no)
     """
     entry = _pending_threads.get(slack_id)
     if not entry:
         return False
     thread_id, _ = entry
 
-    lower = user_text.lower()
-    if "yes" not in lower and "no" not in lower:
-        say("Reply *yes* to save (optionally with changes inline), or *no* to discard.")
-        return True  # still pending — keep thread registered
-
     config = {"configurable": {"thread_id": thread_id}}
     agent_graph.invoke(Command(resume=user_text), config=config)
 
-    # Check if the graph paused again (inline edits → re_propose → human loop)
+    # Check if the graph paused again (change request → re_propose → human loop)
     snapshot = agent_graph.get_state(config)
     if snapshot.next:
         # Still interrupted — updated proposal DM already sent by re_propose_node
         # Refresh the TTL so the user gets another 2 minutes to respond
         _pending_threads[slack_id] = (thread_id, time.time())
-        say("✏️ Applied your changes — check your DMs for the updated proposal.")
         return True  # keep thread registered
 
     # Graph completed
@@ -259,20 +254,20 @@ def has_pending_proposal(slack_id: str) -> bool:
     return slack_id in _pending_threads
 
 
-def run_tool_graph(user_id: str, tool: dict, slot_value: str, channel: str) -> None:
+def run_tool_graph(user_id: str, tool: dict, args: dict, channel: str) -> None:
     """
     Invoke the execute_graph for a saved tool.
     Called from the /tool slash-command handler in slack_bot.py.
     """
     thread_id = f"exec-{user_id}-{int(time.time())}"
     config = {"configurable": {"thread_id": thread_id}}
-    print(f"[graph] executing '{tool['tool_name']}' for '{slot_value}' (thread={thread_id})")
+    print(f"[graph] executing '{tool['tool_name']}' args={args} (thread={thread_id})")
     execute_graph.invoke(
         {
-            "user_id":    user_id,
-            "pattern":    tool,
-            "slot_value": slot_value,
-            "channel":    channel,
+            "user_id": user_id,
+            "pattern": tool,
+            "args":    args,
+            "channel": channel,
         },
         config=config,
     )
