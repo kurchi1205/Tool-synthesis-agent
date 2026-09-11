@@ -101,7 +101,8 @@ def propose_tool(user_id: str, pattern: dict) -> None:
         f"Reply *yes* to confirm."
     )
 
-    app.client.chat_postMessage(channel=slack_id, text=msg)
+    dm_channel = _open_dm(slack_id, app.client)
+    app.client.chat_postMessage(channel=dm_channel, text=msg)
     pending_proposals[slack_id] = pattern
     print(f"[slack_bot] proposed tool '{tool_name}' to {user_id} ({slack_id})")
 
@@ -118,6 +119,23 @@ def confirm_tool(slack_id: str, user_id: str, say) -> None:
 
 
 # ── PART 4: Slash command — /tool ─────────────────────────────────────────────
+
+@app.command("/setup")
+def handle_slash_setup(ack, body, client):
+    """Lets any user manually trigger the calendar setup flow."""
+    ack()
+    slack_user_id = body["user_id"]
+    user_id = _register_user_if_new(slack_user_id, client)
+
+    if is_calendar_connected(user_id):
+        client.chat_postMessage(
+            channel=slack_user_id,
+            text="✅ Your Google Calendar is already connected."
+        )
+        return
+
+    _prompt_calendar_setup(user_id, slack_user_id, client)
+
 
 @app.command("/tool")
 def handle_slash_tool(ack, body, say, client):
@@ -185,6 +203,12 @@ def handle_message(message, say, client):
     if not slack_user_id or message.get("bot_id"):
         return  # ignore bot messages
 
+    # Register + prompt calendar if this user isn't set up yet
+    user_id = _register_user_if_new(slack_user_id, client)
+    if not is_calendar_connected(user_id):
+        _prompt_calendar_setup(user_id, slack_user_id, client)
+        return
+
     # Manual demo trigger
     if text == "!poll now":
         from poller import poll_now
@@ -202,17 +226,10 @@ def handle_message(message, say, client):
 
     # Pending proposal?
     if slack_user_id in pending_proposals:
-        user_id = slack_id_to_user_id(slack_user_id)
         if "yes" in text.lower():
             confirm_tool(slack_user_id, user_id, say)
         else:
             say("Reply *yes* to confirm saving the tool, or ignore to skip.")
-        return
-
-    # Match against this user's saved tools
-    user_id = slack_id_to_user_id(slack_user_id)
-    if not user_id:
-        say("I don't recognise your Slack user ID. Ask an admin to add you to users.json.")
         return
 
     matches = find_matching_tool(user_id, text)
@@ -280,12 +297,21 @@ def _register_user_if_new(slack_user_id: str, client) -> str | None:
     return user_id
 
 
+def _open_dm(slack_user_id: str, client) -> str:
+    """Opens a DM channel with the user and returns the channel ID."""
+    resp = client.conversations_open(users=slack_user_id)
+    dm_channel = resp["channel"]["id"]
+    print(f"[slack_bot] opened DM channel {dm_channel} for {slack_user_id}")
+    return dm_channel
+
+
 def _prompt_calendar_setup(user_id: str, slack_user_id: str, client):
     """DM the user with a Google Calendar auth link."""
     try:
         auth_url = generate_auth_url(user_id, slack_user_id)
-        client.chat_postMessage(
-            channel=slack_user_id,
+        dm_channel = _open_dm(slack_user_id, client)
+        resp = client.chat_postMessage(
+            channel=dm_channel,
             text=(
                 f"Hi! I'm your Tool-Creator bot.\n\n"
                 f"To watch your calendar activity I need access to your Google Calendar.\n"
@@ -293,21 +319,65 @@ def _prompt_calendar_setup(user_id: str, slack_user_id: str, client):
                 f"After you approve, I'll start learning your workflows automatically."
             ),
         )
-        print(f"[slack_bot] sent calendar setup link to {user_id} ({slack_user_id})")
+        print(f"[slack_bot] DM sent ok={resp['ok']} ts={resp.get('ts')} to {user_id} ({slack_user_id})")
     except FileNotFoundError as e:
         print(f"[slack_bot] calendar setup skipped: {e}")
 
 
 def _on_calendar_connected(user_id: str, slack_user_id: str):
     """Called by calendar_auth after token is saved — DM the user to confirm."""
+    dm_channel = _open_dm(slack_user_id, app.client)
     app.client.chat_postMessage(
-        channel=slack_user_id,
+        channel=dm_channel,
         text=(
             f"✅ Google Calendar connected! I'll start watching your calendar activity.\n"
             f"Type `/tool` anytime to see your saved tools."
         ),
     )
     print(f"[slack_bot] calendar connected for {user_id}")
+
+
+def setup_loop(interval_seconds: int = 3600) -> None:
+    """
+    Agentic setup checker — runs in a background thread.
+    On every cycle:
+      1. Fetches all real members in the workspace
+      2. Registers any who aren't in users.json yet
+      3. DMs anyone who hasn't connected Google Calendar
+    Runs once immediately on start, then repeats every interval_seconds (default 1 hour).
+    """
+    import time as _time
+
+    # Wait for the bot socket connection to be established before making API calls
+    _time.sleep(5)
+
+    while True:
+        print("[setup_loop] scanning workspace for unconfigured members ...")
+        try:
+            # Fetch all non-bot, non-deleted workspace members
+            response = app.client.users_list()
+            members  = [
+                m for m in response["members"]
+                if not m.get("is_bot")
+                and not m.get("deleted")
+                and not m.get("is_app_user")
+                and not m.get("is_restricted")
+                and m["id"] != "USLACKBOT"
+            ]
+            print(f"[setup_loop] found {len(members)} real members")
+
+            for member in members:
+                slack_user_id = member["id"]
+                user_id = _register_user_if_new(slack_user_id, app.client)
+
+                if not is_calendar_connected(user_id):
+                    print(f"[setup_loop] {user_id} ({slack_user_id}) has no calendar — prompting ...")
+                    _prompt_calendar_setup(user_id, slack_user_id, app.client)
+
+        except Exception as e:
+            print(f"[setup_loop] error: {e}")
+
+        _time.sleep(interval_seconds)
 
 
 @app.event("team_join")

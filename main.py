@@ -1,7 +1,7 @@
 import threading
 from poller import polling_loop
 from detect import detect_loop
-from slack_bot import start_bot
+from slack_bot import start_bot, setup_loop
 
 
 def main():
@@ -17,6 +17,12 @@ def main():
             kwargs={"interval_seconds": 15},
             daemon=True,
             name="detector",
+        ),
+        threading.Thread(
+            target=setup_loop,
+            kwargs={"interval_seconds": 3600},
+            daemon=True,
+            name="setup-checker",
         ),
     ]
 

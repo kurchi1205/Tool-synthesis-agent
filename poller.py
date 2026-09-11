@@ -1,38 +1,95 @@
 import time
+import os
 import requests
 from datetime import datetime, timezone
 from storage import (
     get_users, get_state, update_state,
     append_event, read_json
 )
-import os
 from dotenv import load_dotenv
 load_dotenv()
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DB_ID = os.getenv("NOTION_DB_ID")
 
+CALENDAR_SCOPES  = ["https://www.googleapis.com/auth/calendar.readonly"]
+CALENDAR_ID      = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+
+
+def _get_calendar_service(user_id: str):
+    """Returns an authenticated Google Calendar service for the given user, or None."""
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+
+    token_file = f"token_{user_id}.json"
+    if not os.path.exists(token_file):
+        print(f"[poller] no calendar token for {user_id} — skipping calendar poll")
+        return None
+
+    creds = Credentials.from_authorized_user_file(token_file, CALENDAR_SCOPES)
+
+    # Refresh if expired
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        with open(token_file, "w") as f:
+            f.write(creds.to_json())
+
+    return build("calendar", "v3", credentials=creds)
+
+
+def _safe_updated_min(last_polled: str) -> str:
+    """
+    Google rejects updatedMin older than ~1 year.
+    If last_polled is too old, fall back to 30 days ago.
+    """
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+    try:
+        polled_dt = datetime.fromisoformat(last_polled.replace("Z", "+00:00"))
+        if polled_dt < cutoff:
+            print(f"[poller] updatedMin {last_polled} too old — using 30 days ago")
+            return cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return last_polled
+
 
 def poll_calendar(user_id: str, config: dict, last_polled: str) -> list[dict]:
-    """
-    MVP: read from mock_events/calendar_{user_id}.json
-    TODO: replace with real Google Calendar API call using last_polled as updatedMin
-    """
-    mock_path = f"mock_events/calendar_{user_id}.json"
-    try:
-        raw = read_json(mock_path)
-        return [
-            {
-                "user_id": user_id,
-                "source": "calendar",
-                "time": item["start"]["dateTime"],
-                "text": item["summary"],
-            }
-            for item in raw
-            if item["start"]["dateTime"] > last_polled
-        ]
-    except FileNotFoundError:
+    """Real Google Calendar API call using last_polled as updatedMin."""
+    service = _get_calendar_service(user_id)
+    if service is None:
         return []
+
+    updated_min = _safe_updated_min(last_polled)
+
+    try:
+        result = service.events().list(
+            calendarId=config.get("calendar_id", CALENDAR_ID),
+            updatedMin=updated_min,
+            singleEvents=True,
+            orderBy="updated",
+            maxResults=50,
+        ).execute()
+    except Exception as e:
+        print(f"[poller] {user_id}/calendar API error: {e}")
+        return []
+
+    events = []
+    for item in result.get("items", []):
+        start     = item.get("start", {})
+        date_time = start.get("dateTime") or start.get("date")
+        if not date_time:
+            continue
+        events.append({
+            "user_id": user_id,
+            "source":  "calendar",
+            "time":    date_time,
+            "text":    item.get("summary", "(no title)"),
+        })
+
+    print(f"[poller] {user_id}/calendar → {len(events)} new events")
+    return events
 
 
 def poll_notion(user_id: str, config: dict, last_polled: str) -> list[dict]:
