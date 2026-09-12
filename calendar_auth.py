@@ -128,7 +128,7 @@ def start_callback_server(on_token_saved=None, port: int = 8080):
     global _on_token_saved
     _on_token_saved = on_token_saved
 
-    server = HTTPServer(("localhost", port), _CallbackHandler)
+    server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="calendar-oauth")
     thread.start()
-    print(f"[calendar_auth] OAuth callback server listening on http://localhost:{port}/callback")
+    print(f"[calendar_auth] OAuth callback server listening on http://127.0.0.1:{port}/callback")

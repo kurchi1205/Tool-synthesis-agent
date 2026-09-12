@@ -5,19 +5,20 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-from executors import EXECUTOR_MAP
-from slack_bot import run_tool
+from agent_graph import run_tool_graph
 
-client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
 channel = os.getenv("SLACK_CHANNEL")
 
 fake_tool = {
     "tool_name": "test_checkin",
     "sequence": ["calendar", "notion", "slack"],
-    "slot": "person",
+    "args": [
+        {"name": "person", "description": "who to meet with", "example": "Alice"},
+        {"name": "topic",  "description": "meeting topic",    "example": "Q3 review"},
+    ],
     "confirmed": True,
 }
 
 print(f"Posting test checklist to channel {channel} ...")
-run_tool(fake_tool, "Alice", channel, client)
+run_tool_graph("u11", fake_tool, {"person": "Alice", "topic": "Q3 review"}, channel)
 print("Done — check your Slack channel.")

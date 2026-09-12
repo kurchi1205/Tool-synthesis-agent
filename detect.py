@@ -94,11 +94,14 @@ Reply with ONLY a valid JSON object, no explanation, no markdown:
 {{
   "is_routine": true,
   "sequence": ["source1", "source2"],
-  "slot": "the thing that varies each time (e.g. person, topic, vendor)",
-  "slot_value": "the specific value in THIS instance",
+  "args": [
+    {{"name": "arg_name", "description": "what this argument represents", "example": "example value"}}
+  ],
   "description": "one sentence describing the routine"
 }}
 
+If there are multiple things that vary (e.g. a person AND a topic), include one entry per arg.
+If nothing varies, use an empty list for args.
 If these events are NOT a routine, reply with exactly: {{"is_routine": false}}"""
 
     for attempt in range(3):
